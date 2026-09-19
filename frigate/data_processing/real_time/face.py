@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import shutil
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,10 @@ logger = logging.getLogger(__name__)
 MAX_DETECTION_HEIGHT = 1080
 MAX_FACES_ATTEMPTS_AFTER_REC = 6
 MAX_FACE_ATTEMPTS = 12
+# Delay before the first automatic embeddings-build attempt at startup, to
+# let the object detector's own first-time model compile settle first. See
+# the comment at the call site for the full rationale.
+FIRST_BUILD_DELAY_SECONDS = 30
 
 
 class FaceRealTimeProcessor(RealTimeProcessorApi):
@@ -94,7 +99,20 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         else:
             self.recognizer = ArcFaceRecognizer(self.config)
 
-        self.recognizer.build()
+        # Calling build() synchronously here means the first embeddings-build
+        # attempt races with the object detector's own first-time OpenVINO
+        # model compile in a *separate* process on the same GPU - right when
+        # the whole pod is busiest at boot (multiple other models still
+        # downloading/loading too). _OPENVINO_LOCK only serializes within a
+        # single process, so it does nothing to protect against that.
+        # A short delay lets the detector's initial compile settle first.
+        # This doesn't fully explain the hang on its own (CPU device hung
+        # too in earlier testing - see discussions/23984), but it matches
+        # the boot-vs-later pattern observed in practice: builds triggered
+        # well after startup succeed far more often than the automatic
+        # first attempt. Later rebuilds (e.g. after clear_face_classifier())
+        # are unaffected - only this first automatic call is deferred.
+        threading.Timer(FIRST_BUILD_DELAY_SECONDS, self.recognizer.build).start()
 
     CONFIG_UPDATE_TOPIC = "config/face_recognition"
 
