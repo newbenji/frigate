@@ -2,6 +2,7 @@ import logging
 import os
 import queue
 import threading
+import time
 from abc import ABC, abstractmethod
 
 import cv2
@@ -216,18 +217,32 @@ def similarity_to_confidence(
     return confidence
 
 
+# The build thread has been observed to silently die mid-inference with no
+# Python exception and no process crash - it just vanishes from the
+# process's thread list, so the queue below never receives a result. Not
+# specific to OpenVINO/ArcFace: seen at least once on this TFLite path too.
+# See github.com/blakeblackshear/frigate discussions/23984.
+FACENET_BUILD_TIMEOUT_SECONDS = 30
+FACENET_BUILD_MAX_RETRIES = 5
+
+
 class FaceNetRecognizer(FaceRecognizer):
     def __init__(self, config: FrigateConfig):
         super().__init__(config)
         self.mean_embs: dict[str, np.ndarray] = {}
         self.face_embedder: FaceNetEmbedding = FaceNetEmbedding()
         self.model_builder_queue: queue.Queue | None = None
+        self.model_builder_thread: threading.Thread | None = None
+        self.model_builder_started_at: float = 0.0
+        self.model_builder_attempts: int = 0
 
     def clear(self) -> None:
         self.mean_embs = {}
 
     def run_build_task(self) -> None:
         self.model_builder_queue = queue.Queue()
+        self.model_builder_started_at = time.monotonic()
+        self.model_builder_attempts += 1
 
         def build_model() -> None:
             face_embeddings_map: dict[str, list[np.ndarray]] = {}
@@ -261,6 +276,7 @@ class FaceNetRecognizer(FaceRecognizer):
 
         thread = threading.Thread(target=build_model, daemon=True)
         thread.start()
+        self.model_builder_thread = thread
 
     def build(self) -> None:
         if not self.landmark_detector:
@@ -274,6 +290,44 @@ class FaceNetRecognizer(FaceRecognizer):
                 )
                 self.model_builder_queue = None
             except queue.Empty:
+                thread_died = (
+                    self.model_builder_thread is not None
+                    and not self.model_builder_thread.is_alive()
+                )
+                timed_out = (
+                    time.monotonic() - self.model_builder_started_at
+                    > FACENET_BUILD_TIMEOUT_SECONDS
+                )
+
+                if not (thread_died or timed_out):
+                    return
+
+                self.model_builder_queue = None
+                self.model_builder_thread = None
+
+                if self.model_builder_attempts >= FACENET_BUILD_MAX_RETRIES:
+                    logger.error(
+                        "FaceNet embeddings build failed to complete after %s "
+                        "attempts (thread_died=%s, timed_out=%s); giving up "
+                        "for this run - face recognition will stay unavailable "
+                        "until the next config/model reload.",
+                        self.model_builder_attempts,
+                        thread_died,
+                        timed_out,
+                    )
+                    return
+
+                logger.warning(
+                    "FaceNet embeddings build thread did not complete "
+                    "(thread_died=%s, timed_out=%s after %.1fs); retrying "
+                    "(attempt %s/%s).",
+                    thread_died,
+                    timed_out,
+                    time.monotonic() - self.model_builder_started_at,
+                    self.model_builder_attempts + 1,
+                    FACENET_BUILD_MAX_RETRIES,
+                )
+                self.run_build_task()
                 return
         else:
             self.run_build_task()
@@ -286,7 +340,7 @@ class FaceNetRecognizer(FaceRecognizer):
             if embs:
                 self.mean_embs[name] = build_class_mean(embs)
 
-        logger.debug("Finished building ArcFace model")
+        logger.debug("Finished building FaceNet model")
 
     def classify(self, face_image: np.ndarray) -> tuple[str, float] | None:
         if not self.landmark_detector:
@@ -327,18 +381,34 @@ class FaceNetRecognizer(FaceRecognizer):
         return label, max(0, round(score - blur_reduction, 2))
 
 
+# ArcFace's build thread has been observed to silently die mid-inference
+# inside OpenVINO's native inference call - no Python exception, no process
+# crash, the thread just vanishes from the process's thread list. When that
+# happens the queue below never receives a result, so build() must be able
+# to notice the thread is gone (or has been running implausibly long) and
+# retry instead of waiting on a queue.get() that will never succeed.
+# See github.com/blakeblackshear/frigate discussions/23984.
+ARCFACE_BUILD_TIMEOUT_SECONDS = 30
+ARCFACE_BUILD_MAX_RETRIES = 5
+
+
 class ArcFaceRecognizer(FaceRecognizer):
     def __init__(self, config: FrigateConfig):
         super().__init__(config)
         self.mean_embs: dict[str, np.ndarray] = {}
         self.face_embedder: ArcfaceEmbedding = ArcfaceEmbedding(config.face_recognition)
         self.model_builder_queue: queue.Queue | None = None
+        self.model_builder_thread: threading.Thread | None = None
+        self.model_builder_started_at: float = 0.0
+        self.model_builder_attempts: int = 0
 
     def clear(self) -> None:
         self.mean_embs = {}
 
     def run_build_task(self) -> None:
         self.model_builder_queue = queue.Queue()
+        self.model_builder_started_at = time.monotonic()
+        self.model_builder_attempts += 1
 
         def build_model() -> None:
             face_embeddings_map: dict[str, list[np.ndarray]] = {}
@@ -372,6 +442,7 @@ class ArcFaceRecognizer(FaceRecognizer):
 
         thread = threading.Thread(target=build_model, daemon=True)
         thread.start()
+        self.model_builder_thread = thread
 
     def build(self) -> None:
         if not self.landmark_detector:
@@ -385,6 +456,44 @@ class ArcFaceRecognizer(FaceRecognizer):
                 )
                 self.model_builder_queue = None
             except queue.Empty:
+                thread_died = (
+                    self.model_builder_thread is not None
+                    and not self.model_builder_thread.is_alive()
+                )
+                timed_out = (
+                    time.monotonic() - self.model_builder_started_at
+                    > ARCFACE_BUILD_TIMEOUT_SECONDS
+                )
+
+                if not (thread_died or timed_out):
+                    return
+
+                self.model_builder_queue = None
+                self.model_builder_thread = None
+
+                if self.model_builder_attempts >= ARCFACE_BUILD_MAX_RETRIES:
+                    logger.error(
+                        "ArcFace embeddings build failed to complete after %s "
+                        "attempts (thread_died=%s, timed_out=%s); giving up "
+                        "for this run - face recognition will stay unavailable "
+                        "until the next config/model reload.",
+                        self.model_builder_attempts,
+                        thread_died,
+                        timed_out,
+                    )
+                    return
+
+                logger.warning(
+                    "ArcFace embeddings build thread did not complete "
+                    "(thread_died=%s, timed_out=%s after %.1fs); retrying "
+                    "(attempt %s/%s).",
+                    thread_died,
+                    timed_out,
+                    time.monotonic() - self.model_builder_started_at,
+                    self.model_builder_attempts + 1,
+                    ARCFACE_BUILD_MAX_RETRIES,
+                )
+                self.run_build_task()
                 return
         else:
             self.run_build_task()
