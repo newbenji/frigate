@@ -346,6 +346,10 @@ COPY web/package.json web/package-lock.json ./
 RUN npm install
 
 COPY web/ ./
+# Default V8 old-space ceiling isn't enough to bundle Monaco editor's chunks
+# on this build machine - raise it explicitly rather than relying on the
+# heuristic based on detected system memory.
+ENV NODE_OPTIONS=--max-old-space-size=6144
 RUN npm run build \
     && mv dist/BASE_PATH/monacoeditorwork/* dist/assets/ \
     && rm -rf dist/BASE_PATH
